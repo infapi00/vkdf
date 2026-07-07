@@ -1,5 +1,6 @@
 #include "vkdf-buffer.hpp"
 #include "vkdf-memory.hpp"
+#include "vkdf-util.hpp"
 
 VkdfBuffer
 vkdf_create_buffer(VkdfContext *ctx,
@@ -44,6 +45,59 @@ vkdf_create_buffer(VkdfContext *ctx,
    return buffer;
 }
 
+/**
+ * If buf's memory is non-coherent, rounds up size to a multiple of
+ * nonCoherentAtomSize, or to VK_WHOLE_SIZE if that would take us past the
+ * end of buf's allocation. This is required so that the range we later
+ * pass to vkFlushMappedMemoryRanges() (either directly, if we request the
+ * same size for the mapping, or implicitly via VK_WHOLE_SIZE, which flushes
+ * up to the end of the current mapping) is always valid: the end of the
+ * mapping must be a multiple of nonCoherentAtomSize from the start of the
+ * memory object or match the end of the memory object exactly.
+ */
+static VkDeviceSize
+adjust_non_coherent_size(VkdfContext *ctx,
+                         VkdfBuffer buf,
+                         VkDeviceSize offset,
+                         VkDeviceSize size)
+{
+   if ((buf.mem_props & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+       size == VK_WHOLE_SIZE) {
+      return size;
+   }
+
+   VkDeviceSize atom_size = ctx->phy_device_props.limits.nonCoherentAtomSize;
+
+   assert(offset % atom_size == 0);
+
+   VkDeviceSize aligned_size = ALIGN(size, atom_size);
+   if (offset + aligned_size >= buf.mem_reqs.size)
+      aligned_size = VK_WHOLE_SIZE;
+
+   return aligned_size;
+}
+
+void
+vkdf_buffer_map(VkdfContext *ctx,
+                VkdfBuffer buf,
+                VkDeviceSize offset,
+                VkDeviceSize size,
+                void **ptr)
+{
+   size = adjust_non_coherent_size(ctx, buf, offset, size);
+   vkdf_memory_map(ctx, buf.mem, offset, size, ptr);
+}
+
+void
+vkdf_buffer_unmap(VkdfContext *ctx,
+                  VkdfBuffer buf,
+                  VkDeviceSize offset,
+                  VkDeviceSize size)
+{
+   size = adjust_non_coherent_size(ctx, buf, offset, size);
+   vkdf_memory_unmap(ctx, buf.mem, buf.mem_props, offset, size);
+}
+
 void
 vkdf_buffer_map_and_fill(VkdfContext *ctx,
                          VkdfBuffer buf,
@@ -52,14 +106,14 @@ vkdf_buffer_map_and_fill(VkdfContext *ctx,
                          const void *data)
 {
    assert(buf.mem_props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+   assert(buf.mem_reqs.size >= offset + size);
 
    void *mapped_memory;
-   vkdf_memory_map(ctx, buf.mem, offset, size, &mapped_memory);
+   vkdf_buffer_map(ctx, buf, offset, size, &mapped_memory);
 
-   assert(buf.mem_reqs.size >= size);
    memcpy(mapped_memory, data, size);
 
-   vkdf_memory_unmap(ctx, buf.mem, buf.mem_props, offset, size);
+   vkdf_buffer_unmap(ctx, buf, offset, size);
 }
 
 void
@@ -75,11 +129,11 @@ vkdf_buffer_map_and_fill_elements(VkdfContext *ctx,
    assert(buf.mem_props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
    assert(dst_stride >= element_size);
 
-   void *mapped_memory;
    VkDeviceSize size = num_elements * dst_stride;
-   assert(buf.mem_reqs.size >= size);
+   assert(buf.mem_reqs.size >= offset + size);
 
-   vkdf_memory_map(ctx, buf.mem, offset, size, &mapped_memory);
+   void *mapped_memory;
+   vkdf_buffer_map(ctx, buf, offset, size, &mapped_memory);
 
    VkDeviceSize dst_offset = 0;
    VkDeviceSize src_offset = 0;
@@ -90,7 +144,7 @@ vkdf_buffer_map_and_fill_elements(VkdfContext *ctx,
       src_offset += src_stride;
    }
 
-   vkdf_memory_unmap(ctx, buf.mem, buf.mem_props, offset, size);
+   vkdf_buffer_unmap(ctx, buf, offset, size);
 }
 
 void
